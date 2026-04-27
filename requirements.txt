@@ -1,2 +1,8 @@
 sounddevice>=0.4.6
 numpy>=1.24
+mido>=1.3
+soundfile>=0.12
+pydub>=0.25
+# Python 3.13 removed the stdlib `audioop` module (PEP 594) that pydub
+# depends on; this is the community backport. Older Pythons skip it.
+audioop-lts>=0.2; python_version >= "3.13"

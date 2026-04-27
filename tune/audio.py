@@ -171,13 +171,19 @@ class Engine:
                 scale = str(self.params.scale)
                 strength = float(self.params.strength)
                 retune = float(self.params.retune_speed)
+                mode = str(self.params.mode)
+                bar_target = int(self.params.bar_target_semitone)
+                octave = int(self.params.octave)
+                additional = int(self.params.additional_range)
                 while in_ring.fill >= hop:
                     in_ring.read_chunk(hop, scratch_in)
                     if bypass:
                         out_block = scratch_in.copy()
                     else:
                         out_block, hz = tuner.process(
-                            scratch_in, key, scale, strength, retune
+                            scratch_in, key, scale, strength, retune,
+                            mode=mode, bar_target_semitone=bar_target,
+                            octave=octave, additional_range=additional,
                         )
                         self.detected_hz = hz
                     out_ring.write_chunk(out_block)

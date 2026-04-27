@@ -16,8 +16,18 @@ from .scales import SCALES, freq_to_midi, midi_to_freq
 
 _TWO_PI = 2.0 * np.pi
 _PI = np.pi
-_RATIO_MIN = 2.0 ** (-4.0 / 12.0)  # -4 semitones ≈ 0.7937
-_RATIO_MAX = 2.0 ** (4.0 / 12.0)   # +4 semitones ≈ 1.2599
+# ±3 octaves of headroom on the per-frame pitch ratio. The previous ±4
+# semitone clamp was a soft musicality limit aimed at gentle pitch
+# correction, but it interacts badly with the user-driven octave/bar
+# controls — every target more than 4 semitones from the detected pitch
+# was getting flattened to the same clamped value, making far octaves
+# and the bar slider feel inert. The user's octave + additional-range
+# window now sets the musical bound on the target; the clamp here is
+# only a numerical safety floor/ceiling. Quality degrades at extreme
+# shifts (this is a phase vocoder, not a granular shifter), which is
+# expected.
+_RATIO_MIN = 2.0 ** (-36.0 / 12.0)  # -3 octaves (= 0.125)
+_RATIO_MAX = 2.0 ** (36.0 / 12.0)   # +3 octaves (= 8.0)
 
 
 class Autotuner:
@@ -92,6 +102,11 @@ class Autotuner:
         scale: str,
         strength: float,
         retune_speed: float,
+        mode: str = "Auto",
+        bar_target_semitone: int = 0,
+        octave: int = 4,
+        additional_range: int = 0,
+        target_hz_override: float | None = None,
     ) -> tuple[np.ndarray, float]:
         if block.shape[0] != self.hop:
             raise ValueError(f"expected hop={self.hop} samples, got {block.shape[0]}")
@@ -108,7 +123,22 @@ class Autotuner:
         hz = self._detect_pitch_robust(mag)
         self.last_hz = hz
 
-        target_ratio = self._snap_with_hysteresis(hz, key, scale) if hz > 0.0 else 1.0
+        if hz <= 0.0:
+            target_ratio = 1.0
+        elif target_hz_override is not None:
+            # Offline song-processing path. Caller drives the target Hz from a
+            # MIDI timeline. <=0 means "no shift" (pass voice through unmodified
+            # while still letting the smoother ramp toward 1.0).
+            if target_hz_override <= 0.0:
+                target_ratio = 1.0
+            else:
+                target_ratio = float(target_hz_override) / hz
+        elif mode == "Bar":
+            target_ratio = self._bar_target_ratio(hz, key, bar_target_semitone, octave)
+        else:
+            target_ratio = self._snap_with_hysteresis(
+                hz, key, scale, octave, additional_range
+            )
 
         # Retune speed: 0 → 1 ms time constant (instant), 100 → 250 ms (slow glide).
         rs = max(0.0, min(1.0, retune_speed / 100.0))
@@ -122,7 +152,7 @@ class Autotuner:
             eff_ratio = float(np.exp(s * np.log(self.smoothed_ratio)))
         else:
             eff_ratio = 1.0
-        eff_ratio = max(_RATIO_MIN, min(_RATIO_MAX, eff_ratio))  # ±4 semitones
+        eff_ratio = max(_RATIO_MIN, min(_RATIO_MAX, eff_ratio))  # ±3 octaves
 
         # ---- Instantaneous frequency per input bin (in bins) ---------------
         delta_phase = phase - self.last_phase
@@ -228,17 +258,32 @@ class Autotuner:
 
         return out, hz
 
+    @staticmethod
+    def _midi_window(octave: int, additional_range: int) -> tuple[int, int]:
+        """Allowed output MIDI range for the given octave + extra semitones.
+
+        Octave numbering follows the C4=MIDI 60 / scientific pitch convention
+        used by ``midi_to_name``: octave N spans MIDI [12*(N+1), 12*(N+2)-1].
+        ``additional_range`` is in semitones (chromatic steps), inclusive on
+        both ends.
+        """
+        base = 12 * (int(octave) + 1)
+        extra = max(0, int(additional_range))
+        return base - extra, base + 11 + extra
+
     def _snap_with_hysteresis(
         self,
         hz: float,
         key: int,
         scale: str,
+        octave: int,
+        additional_range: int,
         smooth_tau_s: float = 0.2,
         switch_margin_cents: float = 30.0,
     ) -> float:
         """Smooth the detected pitch in MIDI space, then snap to a scale
-        note with hysteresis. Returns the ratio that maps current hz to
-        the committed target.
+        note inside the [octave - X, octave + X] window with hysteresis.
+        Returns the ratio that maps current hz to the committed target.
 
         Smoothing averages out vibrato so the snap target stays committed
         to one note even when the live pitch wobbles. Hysteresis prevents
@@ -246,6 +291,11 @@ class Autotuner:
         notes: a new target must beat the current one by at least
         ``switch_margin_cents`` to be adopted. Without these the snap
         target oscillates each vibrato cycle, which sounds like cuts.
+
+        Candidates outside the window are filtered out, which kills the
+        octave-jumping behaviour you'd otherwise see when the input drifts
+        across an octave boundary — the snap is forced into the user's
+        chosen window.
         """
         midi_now = freq_to_midi(hz)
         if self._smoothed_midi is None:
@@ -256,15 +306,23 @@ class Autotuner:
 
         intervals = SCALES.get(scale, SCALES["Chromatic"])
         smooth = self._smoothed_midi
-        octave = int(round(smooth / 12.0))
+        lo, hi = self._midi_window(octave, additional_range)
+        oct_lo = lo // 12 - 1
+        oct_hi = hi // 12 + 1
         candidates = [
             o * 12 + key + i
-            for o in (octave - 1, octave, octave + 1)
+            for o in range(oct_lo, oct_hi + 1)
             for i in intervals
+            if lo <= o * 12 + key + i <= hi
         ]
-        nearest = float(min(candidates, key=lambda m: abs(m - smooth)))
+        if candidates:
+            nearest = float(min(candidates, key=lambda m: abs(m - smooth)))
+        else:
+            # Window contains no scale note — fall back to the nearest
+            # chromatic semitone inside the window.
+            nearest = float(max(lo, min(hi, int(round(smooth)))))
 
-        if self._snapped_midi is None:
+        if self._snapped_midi is None or not (lo <= self._snapped_midi <= hi):
             self._snapped_midi = nearest
         elif nearest != self._snapped_midi:
             cents_to_current = 100.0 * abs(smooth - self._snapped_midi)
@@ -273,6 +331,19 @@ class Autotuner:
                 self._snapped_midi = nearest
 
         return midi_to_freq(self._snapped_midi) / hz
+
+    def _bar_target_ratio(
+        self, hz: float, key: int, semitone: int, octave: int
+    ) -> float:
+        """Bar mode: user picks the scale degree (semitone) directly via the
+        GUI slider. The target is placed in the user's chosen octave, so the
+        output stays anchored regardless of input pitch (the ratio still
+        gets clamped to ±4 semitones downstream — far targets simply hit
+        that ceiling). No smoothing or hysteresis — follows the slider.
+        """
+        base = 12 * (int(octave) + 1)
+        target_midi = float(base + (int(key) + int(semitone)) % 12)
+        return midi_to_freq(target_midi) / hz
 
     def _detect_pitch_robust(
         self,
