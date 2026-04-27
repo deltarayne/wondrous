@@ -45,6 +45,15 @@ class Autotuner:
         w_acf = np.fft.irfft(np.abs(w_spec) ** 2, n=self.N)
         self._w_acf = np.maximum(w_acf, w_acf[0] * 1e-3)
 
+        # Vocal-range bandpass mask applied to the magnitude spectrum
+        # before pitch-detection ACF. Excludes sub-bass rumble and
+        # high-frequency hiss/fan noise that would otherwise contribute
+        # spurious peaks to the autocorrelation. Low edge is set above
+        # the Hann main-lobe leakage region of common AC/HVAC noise so
+        # those don't bleed into the passband. PV pitch shift itself
+        # uses the unmasked spectrum so output tonality is unaffected.
+        self._pitch_band = self._make_bandpass_mask(90.0, 2500.0, transition_hz=30.0)
+
         self.in_buf = np.zeros(self.N, dtype=np.float32)
         self.out_buf = np.zeros(self.N, dtype=np.float32)
         self.last_phase = np.zeros(self.n_bins, dtype=np.float64)
@@ -317,17 +326,47 @@ class Autotuner:
         self._last_valid_hz = median_hz
         return median_hz
 
+    def _make_bandpass_mask(
+        self,
+        lo_hz: float,
+        hi_hz: float,
+        transition_hz: float = 20.0,
+    ) -> np.ndarray:
+        """Raised-cosine bandpass mask over the rfft bins. 1.0 inside the
+        passband, 0.0 outside, smooth raised-cosine ramps of width
+        ``transition_hz`` on each edge to avoid ringing."""
+        freqs = np.arange(self.n_bins, dtype=np.float64) * self.sr / self.N
+        mask = np.zeros(self.n_bins, dtype=np.float64)
+        mask[(freqs >= lo_hz) & (freqs <= hi_hz)] = 1.0
+        lo_ramp = (freqs >= lo_hz - transition_hz) & (freqs < lo_hz)
+        if lo_ramp.any():
+            mask[lo_ramp] = 0.5 * (
+                1.0 - np.cos(
+                    np.pi * (freqs[lo_ramp] - (lo_hz - transition_hz)) / transition_hz
+                )
+            )
+        hi_ramp = (freqs > hi_hz) & (freqs <= hi_hz + transition_hz)
+        if hi_ramp.any():
+            mask[hi_ramp] = 0.5 * (
+                1.0 + np.cos(np.pi * (freqs[hi_ramp] - hi_hz) / transition_hz)
+            )
+        return mask
+
     def _detect_pitch(
         self,
         mag: np.ndarray,
         fmin: float = 70.0,
-        fmax: float = 1000.0,
+        fmax: float = 700.0,
         voicing_enter: float = 0.4,
         voicing_exit: float = 0.25,
     ) -> float:
         """ACF-via-FFT pitch detector with octave-error correction and
         voicing hysteresis. Returns 0.0 if unvoiced."""
-        power = (mag * mag).astype(np.float64)
+        # Apply vocal-range bandpass to the magnitude spectrum before ACF.
+        # Out-of-band content (sub-bass, hiss) doesn't carry pitch info but
+        # does contribute spurious ACF energy at unrelated lags.
+        masked = mag.astype(np.float64) * self._pitch_band
+        power = masked * masked
         acf = np.fft.irfft(power, n=self.N)
         # Debias for the analysis window's own autocorrelation so peaks at
         # the true period dominate over short-lag artifacts.
