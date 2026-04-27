@@ -16,7 +16,11 @@ from .config import load_config, update_config
 
 # Keep dialog file-pickers using these extensions.
 _VOICE_EXTS = (
-    ("Audio files", "*.wav *.flac *.ogg *.aiff *.aif *.mp3 *.m4a *.aac"),
+    (
+        "Audio + video",
+        "*.wav *.flac *.ogg *.aiff *.aif *.mp3 *.m4a *.aac "
+        "*.mp4 *.mov *.m4v *.mkv *.webm",
+    ),
     ("All files", "*.*"),
 )
 _MIDI_EXTS = (
@@ -55,6 +59,23 @@ class SongDialog:
         last_midi = str(self._cfg.get("song_last_midi", "") or "")
         last_output = str(self._cfg.get("song_last_output", "") or "")
         last_overlay = bool(self._cfg.get("song_last_overlay", False))
+        last_overlay_vol = float(self._cfg.get("song_last_overlay_volume", 45.0))
+        last_volume_shaping = bool(self._cfg.get("song_last_volume_shaping", False))
+        last_drywet_on = bool(self._cfg.get("song_last_drywet_enabled", False))
+        last_drywet_pct = float(self._cfg.get("song_last_drywet_pct", 80.0))
+        last_vibrato_on = bool(self._cfg.get("song_last_vibrato_enabled", False))
+        last_vibrato_rate = float(self._cfg.get("song_last_vibrato_rate", 5.0))
+        last_vibrato_depth = float(self._cfg.get("song_last_vibrato_depth", 25.0))
+        last_porta_on = bool(self._cfg.get("song_last_portamento_enabled", False))
+        last_porta_speed = float(self._cfg.get("song_last_portamento_speed", 30.0))
+        last_formant_on = bool(self._cfg.get("song_last_formant_preserve", False))
+        last_reverb_on = bool(self._cfg.get("song_last_reverb_enabled", False))
+        last_reverb_wet = float(self._cfg.get("song_last_reverb_wet", 5.0))
+        last_prepitch_on = bool(self._cfg.get("song_last_prepitch_enabled", False))
+        last_prepitch_pct = float(self._cfg.get("song_last_prepitch_pct", 75.0))
+        last_restrict_vocal = bool(self._cfg.get("song_last_restrict_vocal", False))
+        last_key_centered = bool(self._cfg.get("song_last_key_centered", False))
+        last_lower_midi = bool(self._cfg.get("song_last_lower_midi_octave", False))
 
         self.voice_path_var = tk.StringVar(
             value=last_voice if last_voice and Path(last_voice).is_file() else ""
@@ -65,6 +86,23 @@ class SongDialog:
         # Output path is allowed to point at a not-yet-existing file.
         self.output_path_var = tk.StringVar(value=last_output)
         self.overlay_var = tk.BooleanVar(value=last_overlay)
+        self.overlay_vol_var = tk.DoubleVar(value=last_overlay_vol)
+        self.volume_shaping_var = tk.BooleanVar(value=last_volume_shaping)
+        self.drywet_var = tk.BooleanVar(value=last_drywet_on)
+        self.drywet_pct_var = tk.DoubleVar(value=last_drywet_pct)
+        self.vibrato_var = tk.BooleanVar(value=last_vibrato_on)
+        self.vibrato_rate_var = tk.DoubleVar(value=last_vibrato_rate)
+        self.vibrato_depth_var = tk.DoubleVar(value=last_vibrato_depth)
+        self.portamento_var = tk.BooleanVar(value=last_porta_on)
+        self.portamento_speed_var = tk.DoubleVar(value=last_porta_speed)
+        self.formant_var = tk.BooleanVar(value=last_formant_on)
+        self.reverb_var = tk.BooleanVar(value=last_reverb_on)
+        self.reverb_wet_var = tk.DoubleVar(value=last_reverb_wet)
+        self.prepitch_var = tk.BooleanVar(value=last_prepitch_on)
+        self.prepitch_pct_var = tk.DoubleVar(value=last_prepitch_pct)
+        self.restrict_vocal_var = tk.BooleanVar(value=last_restrict_vocal)
+        self.key_centered_var = tk.BooleanVar(value=last_key_centered)
+        self.lower_midi_var = tk.BooleanVar(value=last_lower_midi)
         self.track_label_var = tk.StringVar(value="(no MIDI loaded)")
         self.preview_status_var = tk.StringVar(value="Idle")
         self.run_status_var = tk.StringVar(value="Ready.")
@@ -139,12 +177,62 @@ class SongDialog:
             .grid(row=1, column=3, sticky="e", padx=4, pady=(0, 4))
         midi.columnconfigure(2, weight=1)
 
-        # Mix options ------------------------------------------------
+        # Voice shaping ----------------------------------------------
+        shape = ttk.LabelFrame(outer, text="Voice shaping")
+        shape.pack(fill="x", pady=(0, 4))
+
+        self._shape_check_row(
+            shape,
+            "Volume shaping (lean into note onsets and pitch changes)",
+            self.volume_shaping_var,
+        )
+        self._shape_check_row(
+            shape,
+            "Restrict to human vocal range (C1..C4)",
+            self.restrict_vocal_var,
+        )
+        self._shape_check_row(
+            shape,
+            "Key centered logic (snap voice to song's key, not melody)",
+            self.key_centered_var,
+        )
+        self._shape_check_row(
+            shape,
+            "Lower MIDI one octave (transpose all MIDI -12 before pitch calc)",
+            self.lower_midi_var,
+        )
+        row_pp = self._shape_check_row(shape, "Prepitch speed", self.prepitch_var)
+        self._shape_slider(row_pp, "Speed", self.prepitch_pct_var, 50, 100,
+                           "%", length=140)
+        row_dw = self._shape_check_row(shape, "Dry/wet mix", self.drywet_var)
+        self._shape_slider(row_dw, "Wet", self.drywet_pct_var, 0, 100, "%", length=140)
+
+        row_vib = self._shape_check_row(shape, "Vibrato", self.vibrato_var)
+        self._shape_slider(row_vib, "Rate", self.vibrato_rate_var, 3, 7,
+                           " Hz", length=80, fmt="{:.1f}")
+        self._shape_slider(row_vib, "Depth", self.vibrato_depth_var, 0, 50,
+                           " ¢", length=80)
+
+        row_porta = self._shape_check_row(shape, "Retune speed", self.portamento_var)
+        self._shape_slider(row_porta, "Speed", self.portamento_speed_var, 0, 100,
+                           "", length=140)
+
+        self._shape_check_row(shape, "Formant preservation", self.formant_var)
+
+        row_rev = self._shape_check_row(shape, "Reverb (small room)", self.reverb_var)
+        self._shape_slider(row_rev, "Wet", self.reverb_wet_var, 0, 30,
+                           "%", length=140)
+
+        # Song overlay ------------------------------------------------
+        row_overlay = ttk.Frame(outer)
+        row_overlay.pack(fill="x", padx=4, pady=(4, 8))
         ttk.Checkbutton(
-            outer,
+            row_overlay,
             text="Song overlay (mix MIDI into output, looped with the pitch changes)",
             variable=self.overlay_var,
-        ).pack(anchor="w", padx=4, pady=(0, 8))
+        ).pack(side="left")
+        self._shape_slider(row_overlay, "Vol", self.overlay_vol_var, 0, 100,
+                           "%", length=120)
 
         # Run progress + status --------------------------------------
         run = ttk.LabelFrame(outer, text="Process")
@@ -169,6 +257,41 @@ class SongDialog:
         # React to text changes (e.g. user types a path).
         self.voice_path_var.trace_add("write", lambda *_: self._update_ok_state())
         self.midi_path_var.trace_add("write", lambda *_: self._update_ok_state())
+
+    def _shape_check_row(self, parent, text: str, var: tk.BooleanVar) -> ttk.Frame:
+        """One row in the Voice-shaping frame: a checkbox plus optional
+        sliders that callers append via ``_shape_slider``. Returns the row
+        frame so the caller can pack additional widgets onto it.
+        """
+        row = ttk.Frame(parent)
+        row.pack(fill="x", padx=4, pady=2)
+        ttk.Checkbutton(row, text=text, variable=var).pack(side="left")
+        return row
+
+    def _shape_slider(
+        self, row: ttk.Frame, label: str, var: tk.DoubleVar,
+        lo: float, hi: float, suffix: str = "", length: int = 120,
+        fmt: str = "{:.0f}",
+    ) -> None:
+        """Append a labelled slider + live value readout to a row built by
+        ``_shape_check_row``."""
+        ttk.Label(row, text=label).pack(side="left", padx=(8, 2))
+        ttk.Scale(
+            row, from_=lo, to=hi, variable=var, orient="horizontal",
+            length=length,
+        ).pack(side="left", padx=2)
+        val_var = tk.StringVar()
+
+        def update(*_, v=var, vv=val_var, f=fmt, sfx=suffix) -> None:
+            try:
+                vv.set(f.format(float(v.get())) + sfx)
+            except (ValueError, tk.TclError):
+                pass
+
+        var.trace_add("write", update)
+        update()
+        ttk.Label(row, textvariable=val_var, width=8, anchor="w")\
+            .pack(side="left", padx=(0, 4))
 
     def _file_row(self, parent, row, label, var, browse_cb, placeholder: str | None = None) -> None:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=4, pady=4)
@@ -345,6 +468,24 @@ class SongDialog:
             return
 
         overlay_on = bool(self.overlay_var.get())
+        overlay_vol_val = float(self.overlay_vol_var.get())
+        volume_shaping_on = bool(self.volume_shaping_var.get())
+        drywet_on = bool(self.drywet_var.get())
+        drywet_pct_val = float(self.drywet_pct_var.get())
+        vibrato_on = bool(self.vibrato_var.get())
+        vibrato_rate_val = float(self.vibrato_rate_var.get())
+        vibrato_depth_val = float(self.vibrato_depth_var.get())
+        portamento_on = bool(self.portamento_var.get())
+        portamento_speed_val = float(self.portamento_speed_var.get())
+        formant_on = bool(self.formant_var.get())
+        reverb_on = bool(self.reverb_var.get())
+        reverb_wet_val = float(self.reverb_wet_var.get())
+        prepitch_on = bool(self.prepitch_var.get())
+        prepitch_pct_val = float(self.prepitch_pct_var.get())
+        restrict_vocal_on = bool(self.restrict_vocal_var.get())
+        key_centered_on = bool(self.key_centered_var.get())
+        lower_midi_on = bool(self.lower_midi_var.get())
+
         overlay_notes: list[song.MidiNote] | None = None
         if overlay_on:
             overlay_notes = []
@@ -359,12 +500,35 @@ class SongDialog:
         # note range — the user explicitly wants song-length loops.
         full_song_end = self._midi_end if self._midi_end > 0 else None
 
+        # Effective values: each checkbox gates whether the slider value is
+        # actually applied. With the box off, fall back to the no-op default.
+        effective_dry_wet = drywet_pct_val if drywet_on else 100.0
+        effective_porta = portamento_speed_val if portamento_on else song.SONG_RETUNE_SPEED
+        effective_reverb_wet = reverb_wet_val if reverb_on else 0.0
+
         # Persist the choices for next time the dialog opens.
         update_config(
             song_last_voice=voice_path,
             song_last_midi=midi_path,
             song_last_output=out_path,
             song_last_overlay=overlay_on,
+            song_last_overlay_volume=overlay_vol_val,
+            song_last_volume_shaping=volume_shaping_on,
+            song_last_drywet_enabled=drywet_on,
+            song_last_drywet_pct=drywet_pct_val,
+            song_last_vibrato_enabled=vibrato_on,
+            song_last_vibrato_rate=vibrato_rate_val,
+            song_last_vibrato_depth=vibrato_depth_val,
+            song_last_portamento_enabled=portamento_on,
+            song_last_portamento_speed=portamento_speed_val,
+            song_last_formant_preserve=formant_on,
+            song_last_reverb_enabled=reverb_on,
+            song_last_reverb_wet=reverb_wet_val,
+            song_last_prepitch_enabled=prepitch_on,
+            song_last_prepitch_pct=prepitch_pct_val,
+            song_last_restrict_vocal=restrict_vocal_on,
+            song_last_key_centered=key_centered_on,
+            song_last_lower_midi_octave=lower_midi_on,
         )
 
         self._stop_preview_playback()
@@ -378,13 +542,46 @@ class SongDialog:
         self._worker = threading.Thread(
             target=self._run_worker,
             args=(voice_path, midi_path, track_option, out_path),
-            kwargs={"overlay_notes": overlay_notes, "full_song_end": full_song_end},
+            kwargs={
+                "overlay_notes": overlay_notes,
+                "overlay_volume_pct": overlay_vol_val,
+                "full_song_end": full_song_end,
+                "volume_shaping": volume_shaping_on,
+                "dry_wet_pct": effective_dry_wet,
+                "vibrato_enabled": vibrato_on,
+                "vibrato_rate_hz": vibrato_rate_val,
+                "vibrato_depth_cents": vibrato_depth_val,
+                "portamento_speed": effective_porta,
+                "formant_preserve": formant_on,
+                "reverb_enabled": reverb_on,
+                "reverb_wet_pct": effective_reverb_wet,
+                "prepitch_speed_enabled": prepitch_on,
+                "prepitch_speed_pct": prepitch_pct_val,
+                "restrict_to_vocal_range": restrict_vocal_on,
+                "key_centered_enabled": key_centered_on,
+                "lower_midi_octave": lower_midi_on,
+            },
             daemon=True,
         )
         self._worker.start()
 
     def _run_worker(self, voice_path, midi_path, track_option, out_path,
-                    *, overlay_notes=None, full_song_end=None) -> None:
+                    *, overlay_notes=None, overlay_volume_pct=45.0,
+                    full_song_end=None,
+                    volume_shaping=False,
+                    dry_wet_pct=100.0,
+                    vibrato_enabled=False,
+                    vibrato_rate_hz=5.0,
+                    vibrato_depth_cents=25.0,
+                    portamento_speed=song.SONG_RETUNE_SPEED,
+                    formant_preserve=False,
+                    reverb_enabled=False,
+                    reverb_wet_pct=0.0,
+                    prepitch_speed_enabled=False,
+                    prepitch_speed_pct=100.0,
+                    restrict_to_vocal_range=False,
+                    key_centered_enabled=False,
+                    lower_midi_octave=False) -> None:
         def report(f: float) -> None:
             try:
                 self.win.after(0, lambda: self.progress_var.set(f * 100.0))
@@ -398,7 +595,22 @@ class SongDialog:
                 track_option=track_option,
                 output_path=out_path,
                 overlay_notes=overlay_notes,
+                overlay_volume_pct=overlay_volume_pct,
                 full_song_end=full_song_end,
+                volume_shaping=volume_shaping,
+                dry_wet_pct=dry_wet_pct,
+                vibrato_enabled=vibrato_enabled,
+                vibrato_rate_hz=vibrato_rate_hz,
+                vibrato_depth_cents=vibrato_depth_cents,
+                portamento_speed=portamento_speed,
+                formant_preserve=formant_preserve,
+                reverb_enabled=reverb_enabled,
+                reverb_wet_pct=reverb_wet_pct,
+                prepitch_speed_enabled=prepitch_speed_enabled,
+                prepitch_speed_pct=prepitch_speed_pct,
+                restrict_to_vocal_range=restrict_to_vocal_range,
+                key_centered_enabled=key_centered_enabled,
+                lower_midi_octave=lower_midi_octave,
                 progress_callback=report,
                 cancel_event=self._cancel_event,
             )

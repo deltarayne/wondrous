@@ -107,6 +107,8 @@ class Autotuner:
         octave: int = 4,
         additional_range: int = 0,
         target_hz_override: float | None = None,
+        voice_hz_override: float | None = None,
+        formant_preserve: bool = False,
     ) -> tuple[np.ndarray, float]:
         if block.shape[0] != self.hop:
             raise ValueError(f"expected hop={self.hop} samples, got {block.shape[0]}")
@@ -123,18 +125,28 @@ class Autotuner:
         hz = self._detect_pitch_robust(mag)
         self.last_hz = hz
 
-        if hz <= 0.0:
-            target_ratio = 1.0
-        elif target_hz_override is not None:
-            # Offline song-processing path. Caller drives the target Hz from
-            # a MIDI timeline (already pre-transposed by song.py to align
-            # the song's range with the voice). <=0 means "no shift" — pass
-            # voice through unmodified while letting the smoother ramp
-            # toward 1.0.
-            if target_hz_override <= 0.0:
+        if target_hz_override is not None:
+            # Offline song-processing path. Caller drives target Hz from a
+            # MIDI timeline (pre-transposed by song.py to align the song's
+            # range with the voice). <=0 means "no shift" — pass voice
+            # through unmodified while letting the smoother ramp to 1.0.
+            #
+            # ``voice_hz_override`` lets the caller replace the detector's
+            # output for ratio computation only. Song mode uses this when
+            # the voice has been time-stretched into a region the detector's
+            # vocal-range mask + ACF range can't see (e.g. 50% speed of a
+            # 110 Hz voice = 55 Hz, below ``fmin = 70``). The override carries
+            # the *expected slowed pitch* (= original_pitch × speed_factor),
+            # so ``target_hz / override`` produces the correct ratio to land
+            # at ``target_hz`` after PV shift. Auto/Bar modes still use the
+            # actual detected ``hz``.
+            ratio_hz = float(voice_hz_override) if voice_hz_override is not None else hz
+            if ratio_hz <= 0.0 or target_hz_override <= 0.0:
                 target_ratio = 1.0
             else:
-                target_ratio = float(target_hz_override) / hz
+                target_ratio = float(target_hz_override) / ratio_hz
+        elif hz <= 0.0:
+            target_ratio = 1.0
         elif mode == "Bar":
             target_ratio = self._bar_target_ratio(hz, key, bar_target_semitone, octave)
         else:
@@ -180,6 +192,43 @@ class Autotuner:
         ) * eff_ratio
         new_mag = np.where(valid, new_mag, 0.0)
         new_freq = np.where(valid, new_freq, 0.0)
+
+        # ---- Formant preservation (cepstral lifter) ------------------------
+        # Standard PV moves formants with the pitch (chipmunk on shifts up,
+        # mumble on shifts down). Lifter approach: split log-spectrum into
+        # smooth envelope (low quefrency = formants) and fine harmonic
+        # structure. Keep the *input's* envelope, apply only the warped
+        # harmonic structure on top of it, so vocal-tract resonances stay
+        # at their original frequencies regardless of pitch.
+        #
+        # Two robustness tweaks for large shifts:
+        #   1. Frequency-dependent blend: apply full correction at low
+        #      frequencies (where formants live and the input's envelope
+        #      is reliable), fade smoothly to NO correction by Nyquist.
+        #      Without this, an upshift's high-K output bins compute
+        #      ``env_in[high_K] / env_in[K/ratio]`` where ``env_in[high_K]``
+        #      is essentially zero (above the input's natural content) and
+        #      the ratio collapses high-frequency output to silence —
+        #      that's the audible "thinning" on big upshifts.
+        #   2. Hard ±12 dB clamp on the (already-blended) correction as a
+        #      belt-and-suspenders safety net for pathological frames.
+        if formant_preserve and eff_ratio > 0.0:
+            env_in = self._spectral_envelope(mag)
+            # The envelope of new_mag is just env_in warped by eff_ratio
+            # (same bin-interpolation as the pitch shift). Compute it
+            # directly instead of running another cepstrum.
+            env_out = (
+                env_in[src_lo_c] * (1.0 - frac) + env_in[src_hi_c] * frac
+            )
+            env_out = np.where(valid, env_out, env_in[0])
+            correction = env_in / np.maximum(env_out, 1e-9)
+            # cos taper: 1 at DC, 0 at Nyquist.
+            blend = 0.5 * (
+                1.0 + np.cos(np.pi * self.bin_idx / max(1, self.n_bins - 1))
+            )
+            correction = correction * blend + (1.0 - blend)
+            np.clip(correction, 0.25, 4.0, out=correction)
+            new_mag = new_mag * correction
 
         # Preserve total spectral energy: linear interpolation can spread a
         # sharp peak across two output bins, losing up to 3 dB. Re-normalize.
@@ -259,6 +308,27 @@ class Autotuner:
         self.out_buf[-self.hop :] = 0.0
 
         return out, hz
+
+    def _spectral_envelope(
+        self, mag: np.ndarray, lifter_n: int = 40,
+    ) -> np.ndarray:
+        """Cepstral spectral envelope: log-mag → IFFT → keep only low
+        quefrencies → FFT → exp. ``lifter_n`` is the cutoff in cepstral
+        bins; 40 separates vocal formants (low quefrency) from the pitch
+        period (high quefrency) cleanly across the human vocal range
+        (lifter cutoff ≈ 0.9 ms; pitch periods ≥ 4 ms even for very high
+        voices). Output is a positive linear-amplitude envelope, length
+        ``n_bins``.
+        """
+        log_mag = np.log(np.maximum(mag.astype(np.float64), 1e-12))
+        # irfft of a real one-sided log spectrum gives a real, symmetric
+        # cepstrum of length N.
+        cepstrum = np.fft.irfft(log_mag, n=self.N)
+        c_lift = cepstrum.copy()
+        if lifter_n < self.N - lifter_n:
+            c_lift[lifter_n:self.N - lifter_n] = 0.0
+        log_env = np.fft.rfft(c_lift).real
+        return np.exp(log_env).astype(np.float64)
 
     @staticmethod
     def _midi_window(octave: int, additional_range: int) -> tuple[int, int]:
