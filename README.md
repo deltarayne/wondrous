@@ -1,6 +1,6 @@
 # tune
 
-Realtime FFT-based autotune for Windows.
+Realtime and file-processing FFT-based autotune for Windows.
 
 Picks an input audio device, runs the signal through a phase-vocoder pitch
 shifter that snaps detected pitch to the nearest note in a chosen key/scale,
