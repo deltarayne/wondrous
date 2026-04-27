@@ -126,9 +126,11 @@ class Autotuner:
         if hz <= 0.0:
             target_ratio = 1.0
         elif target_hz_override is not None:
-            # Offline song-processing path. Caller drives the target Hz from a
-            # MIDI timeline. <=0 means "no shift" (pass voice through unmodified
-            # while still letting the smoother ramp toward 1.0).
+            # Offline song-processing path. Caller drives the target Hz from
+            # a MIDI timeline (already pre-transposed by song.py to align
+            # the song's range with the voice). <=0 means "no shift" — pass
+            # voice through unmodified while letting the smoother ramp
+            # toward 1.0.
             if target_hz_override <= 0.0:
                 target_ratio = 1.0
             else:

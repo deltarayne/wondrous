@@ -11,6 +11,7 @@ import numpy as np
 import sounddevice as sd
 
 from . import song
+from .config import load_config, update_config
 
 
 # Keep dialog file-pickers using these extensions.
@@ -47,9 +48,23 @@ class SongDialog:
         except Exception:
             pass
 
-        self.voice_path_var = tk.StringVar()
-        self.midi_path_var = tk.StringVar()
-        self.output_path_var = tk.StringVar()
+        # Preload the last paths used so the user doesn't have to re-pick on
+        # each invocation. Only restore paths whose files still exist on disk.
+        self._cfg = load_config()
+        last_voice = str(self._cfg.get("song_last_voice", "") or "")
+        last_midi = str(self._cfg.get("song_last_midi", "") or "")
+        last_output = str(self._cfg.get("song_last_output", "") or "")
+        last_overlay = bool(self._cfg.get("song_last_overlay", False))
+
+        self.voice_path_var = tk.StringVar(
+            value=last_voice if last_voice and Path(last_voice).is_file() else ""
+        )
+        self.midi_path_var = tk.StringVar(
+            value=last_midi if last_midi and Path(last_midi).is_file() else ""
+        )
+        # Output path is allowed to point at a not-yet-existing file.
+        self.output_path_var = tk.StringVar(value=last_output)
+        self.overlay_var = tk.BooleanVar(value=last_overlay)
         self.track_label_var = tk.StringVar(value="(no MIDI loaded)")
         self.preview_status_var = tk.StringVar(value="Idle")
         self.run_status_var = tk.StringVar(value="Ready.")
@@ -66,6 +81,9 @@ class SongDialog:
         self._cancel_event = threading.Event()
 
         self._build_ui()
+        # Auto-load MIDI tracks if a preloaded MIDI path is still valid.
+        if self.midi_path_var.get():
+            self._load_midi(self.midi_path_var.get())
         self._update_ok_state()
 
         # Centre over parent.
@@ -120,6 +138,13 @@ class SongDialog:
         ttk.Label(midi, textvariable=self.preview_status_var, width=18)\
             .grid(row=1, column=3, sticky="e", padx=4, pady=(0, 4))
         midi.columnconfigure(2, weight=1)
+
+        # Mix options ------------------------------------------------
+        ttk.Checkbutton(
+            outer,
+            text="Song overlay (mix MIDI into output, looped with the pitch changes)",
+            variable=self.overlay_var,
+        ).pack(anchor="w", padx=4, pady=(0, 8))
 
         # Run progress + status --------------------------------------
         run = ttk.LabelFrame(outer, text="Process")
@@ -319,6 +344,29 @@ class SongDialog:
             )
             return
 
+        overlay_on = bool(self.overlay_var.get())
+        overlay_notes: list[song.MidiNote] | None = None
+        if overlay_on:
+            overlay_notes = []
+            for opt in self._track_options:
+                # Skip the synthetic "auto melody" pseudo-option (its notes
+                # are duplicates of the per-track ones) and skip drums
+                # (sine-wave drums sound nonsensical).
+                if opt.is_auto_melody or opt.is_drum_channel:
+                    continue
+                overlay_notes.extend(opt.notes)
+        # Always loop on the full-song duration, not just the chosen track's
+        # note range — the user explicitly wants song-length loops.
+        full_song_end = self._midi_end if self._midi_end > 0 else None
+
+        # Persist the choices for next time the dialog opens.
+        update_config(
+            song_last_voice=voice_path,
+            song_last_midi=midi_path,
+            song_last_output=out_path,
+            song_last_overlay=overlay_on,
+        )
+
         self._stop_preview_playback()
         self._cancel_event.clear()
         self.ok_btn.state(["disabled"])
@@ -330,11 +378,13 @@ class SongDialog:
         self._worker = threading.Thread(
             target=self._run_worker,
             args=(voice_path, midi_path, track_option, out_path),
+            kwargs={"overlay_notes": overlay_notes, "full_song_end": full_song_end},
             daemon=True,
         )
         self._worker.start()
 
-    def _run_worker(self, voice_path, midi_path, track_option, out_path) -> None:
+    def _run_worker(self, voice_path, midi_path, track_option, out_path,
+                    *, overlay_notes=None, full_song_end=None) -> None:
         def report(f: float) -> None:
             try:
                 self.win.after(0, lambda: self.progress_var.set(f * 100.0))
@@ -347,6 +397,8 @@ class SongDialog:
                 midi_path=midi_path,
                 track_option=track_option,
                 output_path=out_path,
+                overlay_notes=overlay_notes,
+                full_song_end=full_song_end,
                 progress_callback=report,
                 cancel_event=self._cancel_event,
             )

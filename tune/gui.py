@@ -1,14 +1,13 @@
 """Tkinter GUI for the realtime autotune engine."""
 from __future__ import annotations
 
-import json
 import tkinter as tk
-from pathlib import Path
 from tkinter import messagebox, ttk
 
 import sounddevice as sd
 
 from .audio import DeviceInfo, Engine, list_input_devices, list_output_devices
+from .config import load_config, update_config
 from .params import Params
 from .scales import NOTE_NAMES, SCALE_NAMES, SCALES, freq_to_midi, midi_to_name
 
@@ -16,8 +15,6 @@ from .scales import NOTE_NAMES, SCALE_NAMES, SCALES, freq_to_midi, midi_to_name
 FFT_SIZES = [1024, 2048, 4096]
 SAMPLE_RATES = [44100, 48000]
 MODES = ["Auto", "Bar"]
-
-CONFIG_PATH = Path.home() / ".tune" / "config.json"
 
 # clam-themed colour palettes. clam exposes the most surface area for
 # customisation, so we force it as the base theme and override per element.
@@ -51,27 +48,12 @@ THEMES: dict[str, dict[str, str]] = {
 }
 
 
-def _load_config() -> dict:
-    try:
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def _save_config(cfg: dict) -> None:
-    try:
-        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    except Exception:
-        pass
-
-
 class TuneApp:
     def __init__(self) -> None:
         self.params = Params()
         self.engine = Engine(self.params)
 
-        self._cfg = _load_config()
+        self._cfg = load_config()
         self.theme: str = self._cfg.get("theme", "Light")
         if self.theme not in THEMES:
             self.theme = "Light"
@@ -468,8 +450,7 @@ class TuneApp:
             if new_theme in THEMES and new_theme != self.theme:
                 self.theme = new_theme
                 self._apply_theme(self.theme)
-                self._cfg["theme"] = self.theme
-                _save_config(self._cfg)
+                self._cfg = update_config(theme=self.theme)
             dlg.destroy()
 
         ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side="right", padx=4)

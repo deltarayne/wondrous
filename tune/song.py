@@ -16,7 +16,7 @@ import mido
 import soundfile as sf
 
 from .dsp import Autotuner
-from .scales import midi_to_freq, midi_to_name
+from .scales import freq_to_midi, midi_to_freq, midi_to_name
 
 
 # Audio formats we read with libsndfile via soundfile. Anything else gets
@@ -34,6 +34,14 @@ LOOP_PAUSE_S = 0.5
 # user asked for; ~76 ms is short enough to feel snappy on note changes
 # but long enough to avoid clicks at silence boundaries.
 SONG_RETUNE_SPEED = 30.0
+# Voice pre-pass: only sample every Nth hop when estimating median pitch.
+# Cuts a 5-minute file's pre-pass from ~30 s to a few seconds without
+# meaningfully degrading the median estimate.
+VOICE_MEDIAN_HOP_STRIDE = 4
+# When the voice file has no detectable pitch (silence/noise only), fall
+# back to a typical mid-vocal pitch. A3 ≈ 220 Hz is a reasonable centre
+# for both speaking and singing voices.
+VOICE_MEDIAN_FALLBACK_MIDI = 57.0
 
 
 # ---------- MIDI ----------------------------------------------------------
@@ -47,7 +55,11 @@ class MidiNote:
 
 @dataclass
 class TrackOption:
-    """One selectable (track, channel) pair from a MIDI file."""
+    """One selectable target option from a MIDI file. Either a real
+    (track, channel) pair, or the synthetic "auto melody" pseudo-option
+    that aggregates the highest-pitched note across every non-drum
+    track/channel at each instant — flagged via ``track_idx == -1``.
+    """
     track_idx: int
     channel: int
     track_name: str
@@ -67,7 +79,13 @@ class TrackOption:
         return self.channel == 9
 
     @property
+    def is_auto_melody(self) -> bool:
+        return self.track_idx < 0
+
+    @property
     def label(self) -> str:
+        if self.is_auto_melody:
+            return f"{self.track_name}  —  {self.note_count} notes"
         nm = self.track_name or f"Track {self.track_idx}"
         suffix = " [drums]" if self.is_drum_channel else ""
         return f"{nm} (ch {self.channel + 1})  —  {self.note_count} notes{suffix}"
@@ -152,6 +170,24 @@ def load_midi_options(path: str) -> tuple[float, list[TrackOption]]:
         opt.notes.sort(key=lambda n: n.start)
         options.append(opt)
     options.sort(key=lambda o: -o.note_count)
+
+    # Synthesise the "auto melody" option: every non-drum note from every
+    # track/channel, merged. ``MidiTimeline.target_hz_at`` already picks the
+    # highest active pitch, so this gives the cross-track melody envelope
+    # the user wants by default. Inserted at index 0 so it's the dropdown
+    # default.
+    melody_notes: list[MidiNote] = []
+    for opt in options:
+        if opt.is_drum_channel:
+            continue
+        melody_notes.extend(opt.notes)
+    melody_notes.sort(key=lambda n: n.start)
+    auto_melody = TrackOption(
+        track_idx=-1, channel=-1,
+        track_name="Auto melody (all tracks)",
+        notes=melody_notes,
+    )
+    options.insert(0, auto_melody)
     return overall_end, options
 
 
@@ -183,24 +219,22 @@ class MidiTimeline:
         return float(midi_to_freq(float(active_pitches.max())))
 
 
-def render_midi_preview(option: TrackOption, sr: int = _PREVIEW_SR) -> np.ndarray:
-    """Render a track/channel as additive sine tones for the preview player.
-
-    Polyphonic content is rendered as actual chords (notes sum) rather than
-    just the highest pitch — the user uses this to identify the right
-    track, so they should hear what's actually there. Light tanh saturation
-    keeps overlapping sines from clipping.
+def _render_notes_audio(
+    notes: list[MidiNote], total_duration_s: float, sr: int,
+    per_note_amplitude: float = 0.22,
+) -> np.ndarray:
+    """Render ``notes`` to an additive-sine mono buffer of length
+    ``total_duration_s`` seconds at ``sr``. Each note gets a 5 ms attack
+    and 50 ms release. Output is tanh-saturated to keep dense polyphony
+    from clipping.
     """
-    if not option.notes:
-        return np.zeros(0, dtype=np.float32)
-    end = option.end_time + 0.25  # short tail of silence
-    n = max(1, int(end * sr))
+    n = max(1, int(total_duration_s * sr))
     audio = np.zeros(n, dtype=np.float32)
-
+    if not notes:
+        return audio
     attack_n = max(1, int(_PREVIEW_ATTACK_S * sr))
     release_n = max(1, int(_PREVIEW_RELEASE_S * sr))
-
-    for note in option.notes:
+    for note in notes:
         freq = float(midi_to_freq(float(note.pitch)))
         i0 = int(note.start * sr)
         i1 = int(note.end * sr)
@@ -209,7 +243,7 @@ def render_midi_preview(option: TrackOption, sr: int = _PREVIEW_SR) -> np.ndarra
         i1 = min(i1, n)
         nn = i1 - i0
         t = np.arange(nn, dtype=np.float32) / sr
-        sig = 0.25 * np.sin(2.0 * np.pi * freq * t).astype(np.float32)
+        sig = (per_note_amplitude * np.sin(2.0 * np.pi * freq * t)).astype(np.float32)
         env = np.ones(nn, dtype=np.float32)
         a = min(attack_n, nn // 2)
         r = min(release_n, nn // 2)
@@ -218,8 +252,100 @@ def render_midi_preview(option: TrackOption, sr: int = _PREVIEW_SR) -> np.ndarra
         if r > 0:
             env[-r:] = np.linspace(1.0, 0.0, r, dtype=np.float32)
         audio[i0:i1] += sig * env
-
     return np.tanh(audio).astype(np.float32)
+
+
+def render_midi_preview(option: TrackOption, sr: int = _PREVIEW_SR) -> np.ndarray:
+    """Render a track/channel as additive sine tones for the preview player.
+
+    Polyphonic content is rendered as actual chords (notes sum) rather than
+    just the highest pitch — the user uses this to identify the right
+    track, so they should hear what's actually there.
+    """
+    if not option.notes:
+        return np.zeros(0, dtype=np.float32)
+    return _render_notes_audio(option.notes, option.end_time + 0.25, sr)
+
+
+def estimate_voice_median_midi(
+    audio_mono: np.ndarray, sr: int, fft_size: int = 2048,
+) -> float:
+    """Pre-pass on the voice file: median MIDI pitch over voiced hops.
+    Returns ``VOICE_MEDIAN_FALLBACK_MIDI`` if nothing voiced is detected.
+
+    Uses the live engine's pitch detector so the estimate matches what
+    ``Autotuner.process`` will report during the actual run. Sampling every
+    ``VOICE_MEDIAN_HOP_STRIDE`` hops keeps this fast on long files without
+    materially affecting the median.
+    """
+    tuner = Autotuner(fft_size, sr)
+    hop = tuner.hop
+    midis: list[float] = []
+    n = int(audio_mono.shape[0])
+    end = max(0, n - fft_size + 1)
+    step = hop * VOICE_MEDIAN_HOP_STRIDE
+    for h_start in range(0, end, step):
+        block = audio_mono[h_start:h_start + fft_size]
+        windowed = block * tuner.window
+        spec = np.fft.rfft(windowed)
+        mag = np.abs(spec)
+        hz = tuner._detect_pitch_robust(mag)
+        if hz > 0.0:
+            midis.append(float(freq_to_midi(hz)))
+    if not midis:
+        return float(VOICE_MEDIAN_FALLBACK_MIDI)
+    return float(np.median(midis))
+
+
+def midi_duration_weighted_median(notes: list[MidiNote]) -> float | None:
+    """Median MIDI pitch weighted by note duration. A 5-second sustained
+    note pulls the median harder than a 50 ms grace note — better
+    representative of "where the song lives" than counting note onsets.
+    Returns ``None`` for an empty list.
+    """
+    if not notes:
+        return None
+    sorted_notes = sorted(notes, key=lambda n: n.pitch)
+    total_dur = sum(max(0.0, n.end - n.start) for n in sorted_notes)
+    if total_dur <= 0.0:
+        return float(np.median([n.pitch for n in sorted_notes]))
+    target = total_dur / 2.0
+    cum = 0.0
+    for n in sorted_notes:
+        cum += max(0.0, n.end - n.start)
+        if cum >= target:
+            return float(n.pitch)
+    return float(sorted_notes[-1].pitch)
+
+
+def compute_song_octave_shift(
+    voice_median_midi: float, midi_median_midi: float | None,
+) -> float:
+    """Whole-octave shift (in semitones, always a multiple of 12) to apply
+    to every MIDI target so the song's median pitch lands in the same
+    octave as the voice. Preserves the song's contour — every MIDI step is
+    mirrored 1:1 in the voice — while keeping the audible range close to
+    the singer's natural register.
+    """
+    if midi_median_midi is None:
+        return 0.0
+    diff = voice_median_midi - midi_median_midi
+    n_oct = round(diff / 12.0)
+    return 12.0 * float(n_oct)
+
+
+def render_overlay_cycle(
+    notes: list[MidiNote],
+    cycle_end_s: float,
+    pause_s: float,
+    sr: int,
+) -> np.ndarray:
+    """Render exactly one loop cycle of overlay audio: ``cycle_end_s``
+    seconds of MIDI followed by ``pause_s`` seconds of silence. The result
+    can be tiled to match the voice output's length.
+    """
+    total = max(0.0, cycle_end_s) + max(0.0, pause_s)
+    return _render_notes_audio(notes, total, sr, per_note_amplitude=0.16)
 
 
 # ---------- Audio I/O -----------------------------------------------------
@@ -321,6 +447,8 @@ def process_song(
     track_option: TrackOption,
     output_path: str,
     *,
+    overlay_notes: list[MidiNote] | None = None,
+    full_song_end: float | None = None,
     fft_size: int = 2048,
     progress_callback=None,
     cancel_event: threading.Event | None = None,
@@ -328,27 +456,55 @@ def process_song(
     """Read voice + MIDI, repitch voice channel-by-channel to follow MIDI,
     write the result to ``output_path``. Voice file on disk is unchanged.
 
-    Sample rate of the output matches the voice file (no resampling — the
-    user explicitly asked to avoid any pitch/speed side-effects).
+    The loop cycle is ``cycle_end + LOOP_PAUSE_S`` where ``cycle_end`` is
+    ``full_song_end`` if given, otherwise the chosen track's last-note time.
+    Using ``full_song_end`` keeps the loop tied to the whole MIDI file even
+    when the chosen instrument's part stops earlier — without it the voice
+    would re-pitch over the (shorter) track range and fall out of sync with
+    the song.
+
+    If ``overlay_notes`` is non-None, those notes are rendered as additive
+    sines and mixed into the output, looped on the same cycle as the pitch
+    target.
+
+    Output sample rate matches the voice file (no resampling — the user
+    explicitly asked to avoid any pitch/speed side-effects).
     """
     voice, sr = load_audio(voice_path)
     if voice.ndim == 1:
         channels = [voice.astype(np.float32, copy=False)]
+        voice_mono = channels[0]
     else:
         channels = [
             np.ascontiguousarray(voice[:, c], dtype=np.float32)
             for c in range(voice.shape[1])
         ]
+        voice_mono = voice.mean(axis=1).astype(np.float32, copy=False)
+
+    # Pre-pass: estimate voice's median pitch, then choose a single
+    # whole-octave shift that aligns the song's range with the voice. All
+    # MIDI targets get this fixed shift, so the voice mirrors the song's
+    # melodic contour exactly (up moves up, down moves down) and stays
+    # close to the singer's natural register without per-note octave
+    # jumps.
+    voice_median_midi = estimate_voice_median_midi(voice_mono, sr, fft_size)
+    midi_median_midi = midi_duration_weighted_median(track_option.notes)
+    shift_semitones = compute_song_octave_shift(voice_median_midi, midi_median_midi)
+    target_freq_factor = float(2.0 ** (shift_semitones / 12.0))
 
     timeline = MidiTimeline(track_option.notes)
-    midi_end = float(track_option.end_time)
-    cycle_length = midi_end + LOOP_PAUSE_S if midi_end > 0 else 0.0
+    if full_song_end is not None and full_song_end > 0.0:
+        cycle_end = float(full_song_end)
+    else:
+        cycle_end = float(track_option.end_time)
+    cycle_length = cycle_end + LOOP_PAUSE_S if cycle_end > 0.0 else 0.0
 
     n_channels = len(channels)
     out_channels: list[np.ndarray] = []
     for c_idx, ch_audio in enumerate(channels):
         out_ch = _process_channel(
-            ch_audio, sr, fft_size, timeline, midi_end, cycle_length,
+            ch_audio, sr, fft_size, timeline, cycle_end, cycle_length,
+            target_freq_factor=target_freq_factor,
             progress_callback=(
                 lambda f, c=c_idx: (
                     progress_callback((c + f) / n_channels)
@@ -367,6 +523,23 @@ def process_song(
         n = min(c.shape[0] for c in out_channels)
         out = np.stack([c[:n] for c in out_channels], axis=1)
 
+    if overlay_notes is not None and cycle_length > 0.0:
+        cycle_audio = render_overlay_cycle(
+            overlay_notes, cycle_end, LOOP_PAUSE_S, sr,
+        )
+        n_cycle = int(cycle_audio.shape[0])
+        n_out = int(out.shape[0])
+        if n_cycle > 0 and n_out > 0:
+            n_repeats = (n_out + n_cycle - 1) // n_cycle
+            tiled = np.tile(cycle_audio, n_repeats)[:n_out]
+            # ~ -7 dB so the voice stays clearly on top.
+            overlay_gain = 0.45
+            if out.ndim == 1:
+                out = out + overlay_gain * tiled
+            else:
+                out = out + overlay_gain * tiled[:, None]
+            np.clip(out, -1.0, 1.0, out=out)
+
     save_audio(output_path, out, sr)
 
 
@@ -375,9 +548,10 @@ def _process_channel(
     sr: int,
     fft_size: int,
     timeline: MidiTimeline,
-    midi_end: float,
-    cycle_length: float,
+    cycle_end_s: float,
+    cycle_length_s: float,
     *,
+    target_freq_factor: float = 1.0,
     progress_callback=None,
     cancel_event: threading.Event | None = None,
 ) -> np.ndarray:
@@ -410,13 +584,13 @@ def _process_channel(
         # Time in the *original* voice timeline corresponding to the centre
         # of this analysis hop. Use it to look up the MIDI target.
         t_orig = max(0.0, (h * hop - warmup)) / float(sr)
-        if cycle_length > 0.0:
-            t_midi = t_orig % cycle_length
-            if t_midi >= midi_end:
+        if cycle_length_s > 0.0:
+            t_midi = t_orig % cycle_length_s
+            if t_midi >= cycle_end_s:
                 target_hz = 0.0  # silence ramp during the half-second pause
             else:
                 tgt = timeline.target_hz_at(t_midi)
-                target_hz = 0.0 if tgt is None else float(tgt)
+                target_hz = 0.0 if tgt is None else float(tgt) * target_freq_factor
         else:
             target_hz = 0.0
 
