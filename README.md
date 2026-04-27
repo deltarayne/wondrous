@@ -1,4 +1,4 @@
-# tune
+# wondrous
 
 Realtime and file-based FFT autotune for Windows.
 
